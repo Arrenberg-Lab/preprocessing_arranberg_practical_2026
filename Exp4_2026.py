@@ -13,6 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from skimage import io
 import logging
+import tifffile
 
 def ca_prep(config):
     logger = logging.getLogger('ca_prep')
@@ -88,10 +89,10 @@ def ca_prep(config):
         return None
 
 def load_ca_movie(fn):
-    return np.array(io.imread(fn))
+    return tifffile.imread(fn,is_ome=False)
 
 # function for motion correction (registration) of calcium frames (tiff-stack)
-def motion_correction(raw_frames, binsize=500, stepsize=250, show_result=True):
+def motion_correction(raw_frames, binsize=500, stepsize=250, show_result=True, crop_needed=True): #crop_needed=True to remove stimulus artefact in upper part of the tiff file
     if binsize is not None:
         binsize = binsize
     if stepsize is not None:
@@ -113,15 +114,40 @@ def motion_correction(raw_frames, binsize=500, stepsize=250, show_result=True):
         i += stepsize
     reg_frames = regTifImg
     std_image = np.std(reg_frames, axis=0)
+
     if show_result:
-        fig_name = 'Registration_STD_image'
-        fig, ax = plt.subplots(1, 2, figsize=(16, 8), num=fig_name)
-        ax[0].set_title('Raw STD image')
-        ax[0].imshow(np.std(raw_frames, axis=0))
-        ax[1].set_title('Registered STD image')
-        ax[1].imshow(std_image)
-        fig.tight_layout()
-        plt.show()
+        if crop_needed:
+            y1, y2 = 120, None
+            x1, x2 = 0, None
+            raw_std = np.std(raw_frames[y1:y2,x1:x2], axis=0)[y1:y2,x1:x2]
+            reg_std = std_image[y1:y2,x1:x2]
+            p1_raw, p99_raw = np.percentile(raw_std, (1, 99))
+            raw_std_norm = np.clip((raw_std - p1_raw) / (p99_raw - p1_raw), 0, 1)
+            p1_reg, p99_reg = np.percentile(reg_std, (1, 99))
+            reg_std_norm = np.clip((reg_std - p1_reg) / (p99_reg - p1_reg), 0, 1)
+            fig_name = 'Registration_STD_image'
+            fig, ax = plt.subplots(1, 2, figsize=(16, 8), num=fig_name)
+            ax[0].set_title('Raw STD image')
+            ax[0].imshow(raw_std_norm)
+            ax[1].set_title('Registered STD image')
+            ax[1].imshow(reg_std_norm)
+            fig.tight_layout()
+            plt.show()
+        else:
+            raw_std = np.std(raw_frames, axis=0)
+            reg_std = std_image
+            p1_raw, p99_raw = np.percentile(raw_std, (1, 99))
+            raw_std_norm = np.clip((raw_std - p1_raw) / (p99_raw - p1_raw), 0, 1)
+            p1_reg, p99_reg = np.percentile(reg_std, (1, 99))
+            reg_std_norm = np.clip((reg_std - p1_reg) / (p99_reg - p1_reg), 0, 1)
+            fig_name = 'Registration_STD_image'
+            fig, ax = plt.subplots(1, 2, figsize=(16, 8), num=fig_name)
+            ax[0].set_title('Raw STD image')
+            ax[0].imshow(raw_std_norm)
+            ax[1].set_title('Registered STD image')
+            ax[1].imshow(reg_std_norm)
+            fig.tight_layout()
+            plt.show()
     return reg_frames, std_image
 
 
@@ -129,7 +155,7 @@ rnorm = lambda x: (x - x.min()) / (x.max() - x.min())
 
 
 # function for cell segmentation based on watershed algorithm
-def cell_segmentation(std_image, segmentation_params_arg=None,show_segmentation_result=True):
+def cell_segmentation(std_image, segmentation_params_arg=None,show_segmentation_result=True, crop_needed=True): #crop_needed=True to remove stimulus artefact in upper part of the tiff file
     segmentation_params = {
         'hpfiltSig': .1,
         'localThreKerSize': 25,
@@ -145,7 +171,14 @@ def cell_segmentation(std_image, segmentation_params_arg=None,show_segmentation_
         segmentation_params.update(segmentation_params_arg)
 
     # image smoothing
-    hpRaw = cv.GaussianBlur(std_image, (0, 0), segmentation_params['hpfiltSig'])
+    original_shape = std_image.shape
+    if crop_needed:
+        y1, y2 = 120, None
+        x1, x2 = 0, None
+        std_image_cropped = std_image[y1:y2, x1:x2]
+    else:
+        std_image_cropped = std_image
+    hpRaw = cv.GaussianBlur(std_image_cropped, (0, 0), segmentation_params['hpfiltSig'])
     bpRaw = hpRaw / threshold_local(hpRaw, segmentation_params['localThreKerSize'])
     smoothed_std_image = cv.GaussianBlur(rnorm(bpRaw), (0, 0), segmentation_params['smoothSig'])
 
@@ -180,15 +213,27 @@ def cell_segmentation(std_image, segmentation_params_arg=None,show_segmentation_
     for i, v in enumerate(np.unique(labels)):
         sorted_labels[labels == v] = i
 
-    roi_mask = sorted_labels
 
     if show_segmentation_result:
         fig_name = 'sizeFilter'
         fig = plt.figure(figsize=(16, 8), num=fig_name)
         plt.title('ROI Map')
-        plt.imshow(std_image / 40 + 40 * np.squeeze(np.abs(np.gradient(sorted_labels)).sum(axis=0) > 0))
+        p1, p99 = np.percentile(std_image_cropped, (1, 97))
+        img = np.clip((std_image_cropped - p1) / (p99 - p1), 0, 1)
+        edges = np.squeeze(np.abs(np.gradient(sorted_labels)).sum(axis=0) > 0)
+        plt.imshow(img)
+        plt.imshow(edges, cmap='gray',alpha=0.4)
         fig.tight_layout()
         plt.show()
+
+
+    roi_mask_cropped = sorted_labels
+
+    if crop_needed:
+        roi_mask = np.zeros(original_shape, dtype=roi_mask_cropped.dtype)
+        roi_mask[y1:y2, x1:x2] = roi_mask_cropped
+    else:
+        roi_mask = roi_mask_cropped
 
     return roi_mask
 
@@ -269,8 +314,8 @@ def align_stimulus_to_ca_frames(stim_fn,timefn, num_planes, avg_per_layer):
             stim_array[ca_start_frame:ca_end_frame, 1] = np.nan
             stim_array[ca_start_frame:ca_end_frame, 2] = np.nan
     stimulus_info = {'phase': stim_array[:,0],
-                     'speed': stim_array[:,1],
-                     'spatial_freq': stim_array[:,2],
+                     'ang_velocity': stim_array[:,1],
+                     'ang_period': stim_array[:,2],
                      'time': ca_frame_time[0],
                      }
     stimulus_info = pd.DataFrame(data=stimulus_info)
